@@ -12,45 +12,65 @@ except ImportError:
 
 app = Flask(__name__)
 
-class BMTOptimizer:
+class UpdatedBMTOptimizer:
     def __init__(self):
         self.ortools_available = ORTOOLS_AVAILABLE
     
-    def validate_input(self, nurses_df, patients_df):
-        """Validate input data before optimization"""
-        errors = []
+    def calculate_final_acuity(self, base_acuity, new_admit, chemo_frequency):
+        """Calculate final acuity with adjustments"""
+        final_acuity = int(base_acuity)
         
-        # Check required nurse columns
-        required_nurse_cols = ['Nurse_ID', 'Name', 'Skill_Level', 'Chemo_IV_Cert', 'Max_Patients']
-        for col in required_nurse_cols:
-            if col not in nurses_df.columns:
-                errors.append(f"Missing nurse column: {col}")
+        # Add 1 point for new admissions
+        if str(new_admit).upper() == 'Y':
+            final_acuity += 1
         
-        # Check required patient columns
-        required_patient_cols = ['Patient_ID', 'Initials', 'Acuity', 'Chemo_Type']
-        for col in required_patient_cols:
-            if col not in patients_df.columns:
-                errors.append(f"Missing patient column: {col}")
+        # Add 1 point for multiple IV chemo in 12 hours
+        if str(chemo_frequency).lower() == 'multiple':
+            final_acuity += 1
         
-        # Check unit capacity (20 patients max)
-        if len(patients_df) > 20:
-            errors.append(f"Exceeds unit capacity: {len(patients_df)} > 20 patients")
+        return min(final_acuity, 10)  # Cap at 10
+    
+    def determine_vesicant_status(self, central_line, iv_medications, chemo_type):
+        """Determine if patient is receiving vesicant medications"""
+        # Only vesicant if peripheral IV
+        if str(central_line).lower() != 'peripheral':
+            return False
         
-        # Check IV certification balance
-        iv_patients = len(patients_df[patients_df['Chemo_Type'].str.upper() == 'IV'])
-        iv_nurses = len(nurses_df[nurses_df['Chemo_IV_Cert'].str.upper() == 'Y'])
-        if iv_patients > iv_nurses * 2:
-            errors.append(f"Insufficient IV certified nurses: {iv_patients} IV patients need {iv_nurses} certified nurses (max 2 per nurse)")
+        # Check for vesicant medications
+        iv_meds = str(iv_medications).lower()
+        vesicant_conditions = [
+            'antiarrhythmics' in iv_meds,
+            'vasopressors' in iv_meds,
+            str(chemo_type).upper() == 'IV'
+        ]
         
-        # Check total capacity
-        total_capacity = nurses_df['Max_Patients'].sum()
-        if len(patients_df) > total_capacity:
-            errors.append(f"Insufficient total capacity: {len(patients_df)} patients > {total_capacity} total nurse capacity")
+        return any(vesicant_conditions)
+    
+    def preprocess_patient_data(self, patients_df):
+        """Preprocess patient data with new calculations"""
+        processed_patients = patients_df.copy()
         
-        return errors
+        for idx, patient in processed_patients.iterrows():
+            # Calculate final acuity
+            base_acuity = patient.get('Base_Acuity', patient.get('Acuity', 5))
+            new_admit = patient.get('New_Admit', 'N')
+            chemo_freq = patient.get('Chemo_Frequency', 'Single')
+            
+            final_acuity = self.calculate_final_acuity(base_acuity, new_admit, chemo_freq)
+            processed_patients.at[idx, 'Acuity'] = final_acuity
+            
+            # Determine vesicant status
+            central_line = patient.get('Central_Line', 'none')
+            iv_medications = patient.get('IV_Medications', '')
+            chemo_type = patient.get('Chemo_Type', 'none')
+            
+            is_vesicant = self.determine_vesicant_status(central_line, iv_medications, chemo_type)
+            processed_patients.at[idx, 'Vesicant'] = 'Y' if is_vesicant else 'N'
+        
+        return processed_patients
     
     def check_hard_constraints(self, nurse, patient):
-        """Check if assignment violates hard constraints"""
+        """Updated constraint checking with new parameters"""
         violations = []
         
         # IV Chemo certification requirement
@@ -59,62 +79,100 @@ class BMTOptimizer:
         
         # Vesicant handling (requires skill level 2+)
         if str(patient.get('Vesicant', '')).upper() == 'Y' and int(nurse.get('Skill_Level', 1)) < 2:
-            violations.append("Vesicant needs experienced nurse (skill 2+)")
+            violations.append("Vesicant medications need experienced nurse (skill 2+)")
         
-        # High acuity patients need experienced nurses
+        # High acuity patients (8+ still need experienced nurses for complex care)
         if int(patient.get('Acuity', 0)) >= 8 and int(nurse.get('Skill_Level', 1)) < 2:
             violations.append("High acuity (8+) needs experienced nurse")
         
-        # New admits need experienced nurses
-        if str(patient.get('New_Admit', '')).upper() == 'Y' and int(nurse.get('Skill_Level', 1)) < 2:
-            violations.append("New admits need experienced nurse")
+        # CMV constraint: pregnant female nurses cannot take CMV+ patients
+        cmv_status = str(patient.get('CMV_Status', 'Unknown')).upper()
+        pregnancy_status = str(nurse.get('Pregnancy_Status', 'N')).upper()
+        
+        if (cmv_status == 'POSITIVE' and pregnancy_status == 'Y'):
+            violations.append("CMV+ patient cannot be assigned to pregnant nurse")
         
         return violations
     
     def calculate_assignment_score(self, nurse, patient, config):
-        """Calculate desirability score for nurse-patient assignment"""
+        """Calculate assignment score with updated acuity considerations"""
         score = 1  # Base score
         
-        # Continuity bonus (maintain same nurse when possible)
+        # Continuity bonus
         if str(nurse.get('Nurse_ID', '')) == str(patient.get('Last_Nurse', '')):
             score += 10 * config.get('Continuity_Weight', 0.30)
         
-        # Geography bonus (same pod preference)
+        # Geography bonus
         if str(nurse.get('Pod_Pref', '')) == str(patient.get('Pod', '')):
             score += 8 * config.get('Geography_Weight', 0.20)
         elif abs(ord(str(nurse.get('Pod_Pref', 'A'))[0]) - ord(str(patient.get('Pod', 'A'))[0])) == 1:
-            score += 4 * config.get('Geography_Weight', 0.20)  # Adjacent pods
+            score += 4 * config.get('Geography_Weight', 0.20)
         
-        # Skill-acuity matching
+        # Updated skill-acuity matching for 1-10 scale
         skill = int(nurse.get('Skill_Level', 1))
         acuity = int(patient.get('Acuity', 1))
         
-        if skill == 3 and acuity >= 7:  # Expert nurse + high acuity
+        if skill == 3 and acuity >= 8:  # Expert nurse + high complexity
             score += 12 * config.get('Skill_Weight', 0.40)
-        elif skill == 3 and 4 <= acuity <= 6:  # Expert + medium (slight waste)
-            score += 8 * config.get('Skill_Weight', 0.40)
-        elif skill == 2 and 4 <= acuity <= 8:  # Intermediate + medium-high
+        elif skill == 3 and 5 <= acuity <= 7:  # Expert + moderate
             score += 10 * config.get('Skill_Weight', 0.40)
-        elif skill == 1 and acuity <= 4:  # Novice + low
+        elif skill == 2 and 4 <= acuity <= 8:  # Intermediate + varied complexity
+            score += 10 * config.get('Skill_Weight', 0.40)
+        elif skill == 1 and acuity <= 5:  # Novice + lower complexity
             score += 8 * config.get('Skill_Weight', 0.40)
         else:
             # Penalty for poor skill-acuity match
-            mismatch = abs(skill * 2.5 - acuity)
+            mismatch = abs(skill * 3 - acuity)
             score -= mismatch * config.get('Skill_Weight', 0.40)
         
         # Vesicant bonus for highly skilled nurses
         if str(patient.get('Vesicant', '')).upper() == 'Y' and skill == 3:
             score += 5 * config.get('Skill_Weight', 0.40)
         
+        # New admit consideration (higher priority for experienced nurses)
+        if str(patient.get('New_Admit', '')).upper() == 'Y' and skill >= 2:
+            score += 3 * config.get('Skill_Weight', 0.40)
+        
         return score
     
+    def validate_input(self, nurses_df, patients_df):
+        """Validate input with updated parameters"""
+        errors = []
+        
+        # Check required nurse columns
+        required_nurse_cols = ['Nurse_ID', 'Name', 'Skill_Level', 'Chemo_IV_Cert', 'Max_Patients']
+        for col in required_nurse_cols:
+            if col not in nurses_df.columns:
+                errors.append(f"Missing nurse column: {col}")
+        
+        # Check required patient columns (updated)
+        required_patient_cols = ['Patient_ID', 'Initials', 'Base_Acuity', 'Chemo_Type']
+        for col in required_patient_cols:
+            if col not in patients_df.columns and col.replace('Base_', '') not in patients_df.columns:
+                errors.append(f"Missing patient column: {col}")
+        
+        # Check unit capacity
+        if len(patients_df) > 20:
+            errors.append(f"Exceeds unit capacity: {len(patients_df)} > 20 patients")
+        
+        # Check IV certification balance
+        iv_patients = len(patients_df[patients_df['Chemo_Type'].str.upper() == 'IV'])
+        iv_nurses = len(nurses_df[nurses_df['Chemo_IV_Cert'].str.upper() == 'Y'])
+        if iv_patients > iv_nurses * 2:
+            errors.append(f"Insufficient IV certified nurses: {iv_patients} IV patients need {iv_nurses} certified nurses")
+        
+        return errors
+    
     def optimize_assignments(self, nurses_df, patients_df, config):
-        """Main optimization function using OR-Tools"""
+        """Main optimization with updated parameters"""
         if not self.ortools_available:
             return {"error": "OR-Tools optimization not available"}
         
         try:
-            # Validate input data
+            # Preprocess patient data with new calculations
+            patients_df = self.preprocess_patient_data(patients_df)
+            
+            # Validate input
             errors = self.validate_input(nurses_df, patients_df)
             if errors:
                 return {"error": "Validation failed", "details": errors}
@@ -124,7 +182,7 @@ class BMTOptimizer:
             if not solver:
                 return {"error": "Could not create optimization solver"}
             
-            # Decision variables: x[i,j] = 1 if nurse i assigned to patient j
+            # Decision variables
             x = {}
             for i in range(len(nurses_df)):
                 for j in range(len(patients_df)):
@@ -136,7 +194,7 @@ class BMTOptimizer:
             for j in range(len(patients_df)):
                 solver.Add(sum(x[i, j] for i in range(len(nurses_df))) == 1)
             
-            # 2. Nurse capacity limits (ideal 1:3, max 1:4)
+            # 2. Nurse capacity limits
             for i in range(len(nurses_df)):
                 max_pts = int(nurses_df.iloc[i].get('Max_Patients', 4))
                 solver.Add(sum(x[i, j] for j in range(len(patients_df))) <= max_pts)
@@ -152,7 +210,7 @@ class BMTOptimizer:
                         solver.Add(x[i, j] == 0)
                         blocked_assignments += 1
             
-            # 4. IV chemo nurse limit (max 2 IV patients per certified nurse)
+            # 4. IV chemo nurse limit (max 2 per certified nurse)
             for i in range(len(nurses_df)):
                 nurse = nurses_df.iloc[i]
                 if str(nurse.get('Chemo_IV_Cert', '')).upper() == 'Y':
@@ -160,14 +218,13 @@ class BMTOptimizer:
                                  if str(patients_df.iloc[j].get('Chemo_Type', '')).upper() == 'IV')
                     solver.Add(iv_count <= 2)
             
-            # 5. Unit capacity constraint (max 20 patients total)
+            # 5. Unit capacity constraint
             total_assigned = sum(x[i, j] for i in range(len(nurses_df)) for j in range(len(patients_df)))
             solver.Add(total_assigned <= 20)
             
             # OBJECTIVE FUNCTION
             objective = solver.Objective()
             
-            # Maximize assignment scores
             for i in range(len(nurses_df)):
                 nurse = nurses_df.iloc[i]
                 for j in range(len(patients_df)):
@@ -177,17 +234,17 @@ class BMTOptimizer:
             
             # Penalty for exceeding ideal 1:3 ratio
             for i in range(len(nurses_df)):
-                ideal_count = 3  # Ideal nurse:patient ratio
+                ideal_count = 3
                 total_patients = sum(x[i, j] for j in range(len(patients_df)))
                 excess = solver.IntVar(0, 4, f'excess_{i}')
                 solver.Add(excess >= total_patients - ideal_count)
                 solver.Add(excess >= 0)
-                objective.SetCoefficient(excess, -5)  # Penalty for excess patients
+                objective.SetCoefficient(excess, -5)
             
             objective.SetMaximization()
             
-            # Solve with timeout
-            solver.SetTimeLimit(30000)  # 30 seconds maximum
+            # Solve
+            solver.SetTimeLimit(30000)
             status = solver.Solve()
             
             if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
@@ -199,7 +256,7 @@ class BMTOptimizer:
             return {"error": f"Optimization failed: {str(e)}"}
     
     def extract_solution(self, x, nurses_df, patients_df, solver, config, blocked_assignments):
-        """Extract and format the optimization solution"""
+        """Extract solution with updated patient information"""
         assignments = []
         
         for i in range(len(nurses_df)):
@@ -207,44 +264,57 @@ class BMTOptimizer:
             nurse_patients = []
             total_acuity = 0
             iv_count = 0
+            vesicant_count = 0
             
             for j in range(len(patients_df)):
-                if x[i, j].solution_value() > 0.5:  # Patient assigned to this nurse
+                if x[i, j].solution_value() > 0.5:
                     patient = patients_df.iloc[j]
                     
                     patient_data = {
                         'patient_id': str(patient.get('Patient_ID', '')),
                         'initials': str(patient.get('Initials', '')),
-                        'acuity': int(patient.get('Acuity', 1)),
+                        'base_acuity': int(patient.get('Base_Acuity', patient.get('Acuity', 1))),
+                        'final_acuity': int(patient.get('Acuity', 1)),
                         'chemo': str(patient.get('Chemo_Type', 'none')),
+                        'chemo_frequency': str(patient.get('Chemo_Frequency', 'Single')),
                         'chemo_time': str(patient.get('Chemo_Time', '')),
                         'vesicant': str(patient.get('Vesicant', 'N')),
+                        'central_line': str(patient.get('Central_Line', 'none')),
+                        'iv_medications': str(patient.get('IV_Medications', '')),
                         'isolation': str(patient.get('Isolation', 'none')),
+                        'cmv_status': str(patient.get('CMV_Status', 'Unknown')),
+                        'new_admit': str(patient.get('New_Admit', 'N')),
                         'continuity': 'Y' if str(nurse.get('Nurse_ID', '')) == str(patient.get('Last_Nurse', '')) else 'N'
                     }
                     
                     nurse_patients.append(patient_data)
                     total_acuity += int(patient.get('Acuity', 1))
+                    
                     if str(patient.get('Chemo_Type', '')).upper() == 'IV':
                         iv_count += 1
+                    if str(patient.get('Vesicant', '')).upper() == 'Y':
+                        vesicant_count += 1
             
-            if nurse_patients:  # Only include nurses with assignments
+            if nurse_patients:
                 patient_count = len(nurse_patients)
                 assignments.append({
                     'nurse_id': str(nurse.get('Nurse_ID', '')),
                     'nurse_name': str(nurse.get('Name', '')),
                     'role': str(nurse.get('Role', 'RN')),
                     'skill_level': int(nurse.get('Skill_Level', 1)),
+                    'pregnancy_status': str(nurse.get('Pregnancy_Status', 'N')),
                     'phone': str(nurse.get('Phone_Number', '')),
                     'patients': nurse_patients,
                     'patient_count': patient_count,
                     'total_acuity': total_acuity,
                     'iv_chemo_count': iv_count,
+                    'vesicant_count': vesicant_count,
                     'ratio_status': 'ideal' if patient_count <= 3 else 'maximum',
-                    'continuity_count': sum(1 for p in nurse_patients if p['continuity'] == 'Y')
+                    'continuity_count': sum(1 for p in nurse_patients if p['continuity'] == 'Y'),
+                    'new_admit_count': sum(1 for p in nurse_patients if p['new_admit'] == 'Y')
                 })
         
-        # Calculate overall statistics
+        # Calculate statistics
         if assignments:
             acuities = [a['total_acuity'] for a in assignments]
             patient_counts = [a['patient_count'] for a in assignments]
@@ -259,6 +329,9 @@ class BMTOptimizer:
                 'ideal_ratios': sum(1 for count in patient_counts if count <= 3),
                 'max_ratios': sum(1 for count in patient_counts if count == 4),
                 'continuity_preserved': sum(a['continuity_count'] for a in assignments),
+                'new_admissions': sum(a['new_admit_count'] for a in assignments),
+                'total_iv_chemo': sum(a['iv_chemo_count'] for a in assignments),
+                'total_vesicants': sum(a['vesicant_count'] for a in assignments),
                 'blocked_assignments': blocked_assignments,
                 'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'objective_value': round(solver.Objective().Value(), 2),
@@ -313,8 +386,9 @@ class BMTOptimizer:
                 nurse_workloads[best_nurse['Nurse_ID']]['patients'].append({
                     'patient_id': patient['Patient_ID'],
                     'initials': patient['Initials'],
-                    'acuity': patient['Acuity'],
-                    'chemo': patient.get('Chemo_Type', 'none')
+                    'final_acuity': patient['Acuity'],
+                    'chemo': patient.get('Chemo_Type', 'none'),
+                    'vesicant': patient.get('Vesicant', 'N')
                 })
                 nurse_workloads[best_nurse['Nurse_ID']]['acuity'] += patient['Acuity']
                 unassigned_patients = unassigned_patients.drop(idx)
@@ -350,45 +424,50 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "service": "BMT Assignment Optimizer",
-        "version": "1.0.2",
+        "service": "Updated BMT Assignment Optimizer",
+        "version": "2.0.0",
         "ortools_available": ORTOOLS_AVAILABLE,
         "endpoints": ["/", "/test", "/optimize"],
+        "updates": [
+            "Updated vesicant definition (peripheral IV + specific medications)",
+            "Multiple chemo acuity adjustment (+1 point)", 
+            "New admission acuity bonus (+1 point)",
+            "1-10 acuity scale with defined levels",
+            "CMV pregnancy constraint (pregnant nurses only)",
+            "Removed transfusion parameters",
+            "Automatic acuity and vesicant calculation"
+        ],
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     })
 
 @app.route('/test', methods=['GET'])
-def test_optimization():
-    """Test endpoint with realistic BMT sample data"""
+def test_updated_optimization():
+    """Test endpoint with updated BMT sample data"""
     if not ORTOOLS_AVAILABLE:
         return jsonify({
             "error": "OR-Tools not available",
             "message": "Optimization functionality disabled"
         }), 500
     
-    # Realistic BMT night shift sample data
+    # Updated sample data with new parameters
     nurses_data = [
-        {"Nurse_ID": "N001", "Name": "Johnson, Sarah", "Role": "RN", "Skill_Level": 3, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "A", "Phone_Number": "+1234567890"},
-        {"Nurse_ID": "N002", "Name": "Martinez, Lisa", "Role": "RN", "Skill_Level": 2, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "B", "Phone_Number": "+1234567891"},
-        {"Nurse_ID": "N003", "Name": "Chen, Michael", "Role": "RN", "Skill_Level": 3, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "C", "Phone_Number": "+1234567892"},
-        {"Nurse_ID": "N004", "Name": "Williams, Karen", "Role": "RN", "Skill_Level": 2, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "A", "Phone_Number": "+1234567893"},
-        {"Nurse_ID": "N005", "Name": "Brown, James", "Role": "LVN", "Skill_Level": 2, "Chemo_IV_Cert": "N", "Max_Patients": 4, "Pod_Pref": "B", "Phone_Number": "+1234567894"},
-        {"Nurse_ID": "N006", "Name": "Davis, Amanda", "Role": "RN", "Skill_Level": 1, "Chemo_IV_Cert": "N", "Max_Patients": 4, "Pod_Pref": "C", "Phone_Number": "+1234567895"}
+        {"Nurse_ID": "N001", "Name": "Johnson, Sarah", "Role": "RN", "Skill_Level": 3, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "A", "Pregnancy_Status": "N", "Phone_Number": "+1234567890"},
+        {"Nurse_ID": "N002", "Name": "Martinez, Lisa", "Role": "RN", "Skill_Level": 2, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "B", "Pregnancy_Status": "N", "Phone_Number": "+1234567891"},
+        {"Nurse_ID": "N003", "Name": "Chen, Michael", "Role": "RN", "Skill_Level": 3, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "C", "Pregnancy_Status": "N/A", "Phone_Number": "+1234567892"},
+        {"Nurse_ID": "N004", "Name": "Williams, Karen", "Role": "RN", "Skill_Level": 2, "Chemo_IV_Cert": "Y", "Max_Patients": 4, "Pod_Pref": "A", "Pregnancy_Status": "Prefer_Not_To_Say", "Phone_Number": "+1234567893"},
+        {"Nurse_ID": "N005", "Name": "Brown, James", "Role": "LVN", "Skill_Level": 2, "Chemo_IV_Cert": "N", "Max_Patients": 4, "Pod_Pref": "B", "Pregnancy_Status": "N/A", "Phone_Number": "+1234567894"},
+        {"Nurse_ID": "N006", "Name": "Davis, Amanda", "Role": "RN", "Skill_Level": 1, "Chemo_IV_Cert": "N", "Max_Patients": 4, "Pod_Pref": "C", "Pregnancy_Status": "Y", "Phone_Number": "+1234567895"}
     ]
     
     patients_data = [
-        {"Patient_ID": "301A", "Initials": "J.D.", "Pod": "A", "Acuity": 8, "Chemo_Type": "IV", "Chemo_Time": "20:00", "Vesicant": "Y", "Isolation": "contact", "Last_Nurse": "N001"},
-        {"Patient_ID": "302A", "Initials": "M.K.", "Pod": "A", "Acuity": 5, "Chemo_Type": "oral", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N001"},
-        {"Patient_ID": "303A", "Initials": "R.L.", "Pod": "A", "Acuity": 3, "Chemo_Type": "none", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N004"},
-        {"Patient_ID": "304A", "Initials": "S.B.", "Pod": "A", "Acuity": 6, "Chemo_Type": "IV", "Chemo_Time": "21:30", "Vesicant": "N", "Isolation": "neutropenic", "New_Admit": "Y", "Last_Nurse": "N002"},
-        {"Patient_ID": "305B", "Initials": "T.M.", "Pod": "B", "Acuity": 9, "Chemo_Type": "IV", "Chemo_Time": "19:30", "Vesicant": "Y", "Isolation": "contact", "Last_Nurse": "N002"},
-        {"Patient_ID": "306B", "Initials": "K.W.", "Pod": "B", "Acuity": 4, "Chemo_Type": "oral", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N002"},
-        {"Patient_ID": "307B", "Initials": "L.P.", "Pod": "B", "Acuity": 7, "Chemo_Type": "none", "Chemo_Time": "", "Vesicant": "N", "Isolation": "droplet", "Last_Nurse": "N005"},
-        {"Patient_ID": "308B", "Initials": "D.F.", "Pod": "B", "Acuity": 2, "Chemo_Type": "none", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "New_Admit": "Y", "Last_Nurse": ""},
-        {"Patient_ID": "309C", "Initials": "A.G.", "Pod": "C", "Acuity": 5, "Chemo_Type": "oral", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N003"},
-        {"Patient_ID": "310C", "Initials": "B.H.", "Pod": "C", "Acuity": 8, "Chemo_Type": "none", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N003"},
-        {"Patient_ID": "311C", "Initials": "C.J.", "Pod": "C", "Acuity": 3, "Chemo_Type": "none", "Chemo_Time": "", "Vesicant": "N", "Isolation": "none", "Last_Nurse": "N006"},
-        {"Patient_ID": "312C", "Initials": "E.N.", "Pod": "C", "Acuity": 6, "Chemo_Type": "oral", "Chemo_Time": "", "Vesicant": "N", "Isolation": "contact", "Last_Nurse": "N006"}
+        {"Patient_ID": "301A", "Initials": "J.D.", "Pod": "A", "Base_Acuity": 7, "New_Admit": "N", "Chemo_Type": "IV", "Chemo_Frequency": "Single", "Chemo_Time": "20:00", "Central_Line": "peripheral", "IV_Medications": "chemo", "Isolation": "contact", "CMV_Status": "Negative", "Last_Nurse": "N001"},
+        {"Patient_ID": "302A", "Initials": "M.K.", "Pod": "A", "Base_Acuity": 4, "New_Admit": "N", "Chemo_Type": "oral", "Chemo_Frequency": "Single", "Central_Line": "none", "IV_Medications": "", "Isolation": "none", "CMV_Status": "Negative", "Last_Nurse": "N001"},
+        {"Patient_ID": "303A", "Initials": "R.L.", "Pod": "A", "Base_Acuity": 3, "New_Admit": "N", "Chemo_Type": "none", "Chemo_Frequency": "Single", "Central_Line": "none", "IV_Medications": "", "Isolation": "none", "CMV_Status": "Unknown", "Last_Nurse": "N004"},
+        {"Patient_ID": "304A", "Initials": "S.B.", "Pod": "A", "Base_Acuity": 5, "New_Admit": "Y", "Chemo_Type": "IV", "Chemo_Frequency": "Multiple", "Chemo_Time": "08:00,20:00", "Central_Line": "PICC", "IV_Medications": "chemo", "Isolation": "neutropenic", "CMV_Status": "Positive", "Last_Nurse": ""},
+        {"Patient_ID": "305B", "Initials": "T.M.", "Pod": "B", "Base_Acuity": 8, "New_Admit": "N", "Chemo_Type": "none", "Chemo_Frequency": "Single", "Central_Line": "peripheral", "IV_Medications": "vasopressors", "Isolation": "contact", "CMV_Status": "Positive", "Last_Nurse": "N002"},
+        {"Patient_ID": "306B", "Initials": "K.W.", "Pod": "B", "Base_Acuity": 3, "New_Admit": "N", "Chemo_Type": "oral", "Chemo_Frequency": "Single", "Central_Line": "none", "IV_Medications": "", "Isolation": "none", "CMV_Status": "Negative", "Last_Nurse": "N002"},
+        {"Patient_ID": "307B", "Initials": "L.P.", "Pod": "B", "Base_Acuity": 6, "New_Admit": "N", "Chemo_Type": "none", "Chemo_Frequency": "Single", "Central_Line": "peripheral", "IV_Medications": "antiarrhythmics", "Isolation": "droplet", "CMV_Status": "Unknown", "Last_Nurse": "N005"},
+        {"Patient_ID": "308B", "Initials": "D.F.", "Pod": "B", "Base_Acuity": 2, "New_Admit": "Y", "Chemo_Type": "none", "Chemo_Frequency": "Single", "Central_Line": "none", "IV_Medications": "", "Isolation": "none", "CMV_Status": "Negative", "Last_Nurse": ""}
     ]
     
     config = {
@@ -402,7 +481,7 @@ def test_optimization():
     nurses_df = pd.DataFrame(nurses_data)
     patients_df = pd.DataFrame(patients_data)
     
-    optimizer = BMTOptimizer()
+    optimizer = UpdatedBMTOptimizer()
     result = optimizer.optimize_assignments(nurses_df, patients_df, config)
     
     return jsonify(result)
@@ -436,7 +515,7 @@ def optimize():
         patients_df = pd.DataFrame(patients_data)
         
         # Run optimization
-        optimizer = BMTOptimizer()
+        optimizer = UpdatedBMTOptimizer()
         result = optimizer.optimize_assignments(nurses_df, patients_df, config)
         
         return jsonify(result)
