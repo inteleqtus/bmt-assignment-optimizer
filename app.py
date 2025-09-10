@@ -529,3 +529,15 @@ def optimize():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+# Add this route to your existing app.py
+@app.route('/review/<date>', methods=['GET'])
+def review_interface(date):
+    # Get pending assignments from n8n webhook data
+    return render_template('review.html', date=date)
+
+@app.route('/review/submit', methods=['POST'])
+def submit_review():
+    # Process charge nurse decision
+    # Send webhook response back to n8n
+    pass
